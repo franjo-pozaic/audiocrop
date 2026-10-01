@@ -83,7 +83,7 @@ class AudioPlayer:
                 samplerate=self.samplerate,
                 channels=self.channels,
                 callback=self._callback,
-                blocksize=2048,
+                blocksize=1024,
             )
             self.stream.start()
 
@@ -104,25 +104,48 @@ class AudioPlayer:
         with self._lock:
             frame = self.position + int(seconds * self.samplerate)
             self.position = max(0, min(frame, self.total_frames))
+            self._needs_flush = True
 
     def seek_to(self, seconds: float):
         with self._lock:
             self.position = max(0, min(int(seconds * self.samplerate), self.total_frames))
+            self._needs_flush = True
+
+    def flush_if_needed(self):
+        """Call once per frame after processing all keys."""
+        if not getattr(self, '_needs_flush', False):
+            return
+        self._needs_flush = False
+        if self.stream and self.playing:
+            self.stream.abort()
+            self.stream.close()
+            self.stream = sd.OutputStream(
+                samplerate=self.samplerate,
+                channels=self.channels,
+                callback=self._callback,
+                blocksize=1024,
+            )
+            self.stream.start()
 
     @property
     def current_time(self) -> float:
         return self.position / self.samplerate
 
     def get_waveform_peaks(self, num_bins: int) -> np.ndarray:
-        """Downsample audio to num_bins peak values for display."""
+        """Downsample audio to num_bins peak values for display. Cached."""
+        if hasattr(self, '_peaks_cache') and self._peaks_cache[0] == num_bins:
+            return self._peaks_cache[1]
+
         mono = self.data.mean(axis=1) if self.data.ndim > 1 else self.data.flatten()
-        frames_per_bin = max(1, len(mono) // num_bins)
-        peaks = np.zeros(num_bins)
-        for i in range(num_bins):
-            start = i * frames_per_bin
-            end = min(start + frames_per_bin, len(mono))
-            if start < len(mono):
-                peaks[i] = np.max(np.abs(mono[start:end]))
+        # Use reshape trick for speed instead of Python loop
+        usable = (len(mono) // num_bins) * num_bins
+        if usable > 0:
+            reshaped = np.abs(mono[:usable]).reshape(num_bins, -1)
+            peaks = reshaped.max(axis=1)
+        else:
+            peaks = np.zeros(num_bins)
+
+        self._peaks_cache = (num_bins, peaks)
         return peaks
 
 
@@ -256,7 +279,7 @@ def main(stdscr, filepath: str):
     curses.curs_set(0)
     curses.use_default_colors()
     stdscr.nodelay(True)
-    stdscr.timeout(50)  # 50ms refresh
+    stdscr.timeout(16)  # ~60fps refresh
 
     # Init color pairs
     curses.init_pair(1, curses.COLOR_GREEN, -1)   # waveform
@@ -287,88 +310,102 @@ def main(stdscr, filepath: str):
         status_time = time.time()
 
     while True:
+        # Drain all pending keys before redrawing
+        keys = []
         try:
             key = stdscr.get_wch()
+            keys.append(key)
+            # Keep reading while there are buffered keys
+            while True:
+                try:
+                    key = stdscr.get_wch()
+                    keys.append(key)
+                except curses.error:
+                    break
         except curses.error:
-            key = None
+            pass
 
-        # Handle input
-        if key == " ":
-            player.toggle()
-        elif key == "q" or key == "\x1b":
-            player.pause()
-            break
-        elif key == "h" or key == curses.KEY_LEFT:
-            player.seek(-10)
-        elif key == "l" or key == curses.KEY_RIGHT:
-            player.seek(10)
-        elif key == "H":
-            player.seek(-1)
-        elif key == "L":
-            player.seek(1)
-        elif key == "W":
-            player.seek(30)
-        elif key == "B":
-            player.seek(-30)
-        elif key == "s":
-            start_marker = player.current_time
-            status_msg = f"Start marker: {format_time(start_marker)}"
-            status_time = time.time()
-        elif key == "e":
-            end_marker = player.current_time
-            status_msg = f"End marker: {format_time(end_marker)}"
-            status_time = time.time()
-        elif key == "0":
-            player.seek_to(0)
-        elif key == "$":
-            player.seek_to(player.duration)
-        elif key == "g":
-            if start_marker is not None:
-                player.seek_to(start_marker)
-        elif key == "G":
-            if end_marker is not None:
-                player.seek_to(end_marker)
-        elif key == "\n" or key == curses.KEY_ENTER:
-            if start_marker is not None and end_marker is not None:
-                if start_marker < end_marker:
-                    player.pause()
-                    status_msg = "Rendering..."
-                    status_time = time.time()
-                    stdscr.clear()
-                    stdscr.addstr(0, 0, "Rendering... please wait")
-                    stdscr.refresh()
-                    try:
-                        out = render_selection(filepath, start_marker, end_marker)
-                        status_msg = f"Saved: {out}"
-                    except subprocess.CalledProcessError as ex:
-                        status_msg = f"ffmpeg error: {ex.stderr.decode()[:80]}"
-                    status_time = time.time()
+        for key in keys:
+            # Handle input
+            if key == " ":
+                player.toggle()
+            elif key == "q" or key == "\x1b":
+                player.pause()
+                return
+            elif key == "h" or key == curses.KEY_LEFT:
+                player.seek(-10)
+            elif key == "l" or key == curses.KEY_RIGHT:
+                player.seek(10)
+            elif key == "H":
+                player.seek(-1)
+            elif key == "L":
+                player.seek(1)
+            elif key == "W":
+                player.seek(30)
+            elif key == "B":
+                player.seek(-30)
+            elif key == "s":
+                start_marker = player.current_time
+                status_msg = f"Start marker: {format_time(start_marker)}"
+                status_time = time.time()
+            elif key == "e":
+                end_marker = player.current_time
+                status_msg = f"End marker: {format_time(end_marker)}"
+                status_time = time.time()
+            elif key == "0":
+                player.seek_to(0)
+            elif key == "$":
+                player.seek_to(player.duration)
+            elif key == "g":
+                if start_marker is not None:
+                    player.seek_to(start_marker)
+            elif key == "G":
+                if end_marker is not None:
+                    player.seek_to(end_marker)
+            elif key == "\n" or key == curses.KEY_ENTER:
+                if start_marker is not None and end_marker is not None:
+                    if start_marker < end_marker:
+                        player.pause()
+                        status_msg = "Rendering..."
+                        status_time = time.time()
+                        stdscr.clear()
+                        stdscr.addstr(0, 0, "Rendering... please wait")
+                        stdscr.refresh()
+                        try:
+                            out = render_selection(filepath, start_marker, end_marker)
+                            status_msg = f"Saved: {out}"
+                        except subprocess.CalledProcessError as ex:
+                            status_msg = f"ffmpeg error: {ex.stderr.decode()[:80]}"
+                        status_time = time.time()
+                    else:
+                        status_msg = "Error: start must be before end"
+                        status_time = time.time()
                 else:
-                    status_msg = "Error: start must be before end"
+                    status_msg = "Set both markers first (s/e)"
                     status_time = time.time()
-            else:
-                status_msg = "Set both markers first (s/e)"
+            # Arrow key escape sequences for shift/cmd combos
+            elif key == curses.KEY_SLEFT:
+                player.seek(-1)
+            elif key == curses.KEY_SRIGHT:
+                player.seek(1)
+            elif key == "+" or key == "=":
+                player.volume = min(5.0, player.volume + 0.1)
+                status_msg = f"Volume: {player.volume:.0%}"
                 status_time = time.time()
-        # Arrow key escape sequences for shift/cmd combos
-        elif key == curses.KEY_SLEFT:
-            player.seek(-1)
-        elif key == curses.KEY_SRIGHT:
-            player.seek(1)
-        elif key == "+" or key == "=":
-            player.volume = min(5.0, player.volume + 0.1)
-            status_msg = f"Volume: {player.volume:.0%}"
-            status_time = time.time()
-        elif key == "-":
-            player.volume = max(0.0, player.volume - 0.1)
-            status_msg = f"Volume: {player.volume:.0%}"
-            status_time = time.time()
-        elif key == "\t":
-            nf = next_file(filepath)
-            if nf:
-                load_file(nf)
-            else:
-                status_msg = "No other audio files in directory"
+            elif key == "-":
+                player.volume = max(0.0, player.volume - 0.1)
+                status_msg = f"Volume: {player.volume:.0%}"
                 status_time = time.time()
+            elif key == "\t":
+                nf = next_file(filepath)
+                if nf:
+                    load_file(nf)
+                else:
+                    status_msg = "No other audio files in directory"
+                    status_time = time.time()
+
+        # Flush audio buffer once after all keys processed
+        player.flush_if_needed()
 
         # Draw
         stdscr.erase()
