@@ -55,24 +55,45 @@ class AudioPlayer:
         self.playing = False
         self.stream = None
         self.volume = 1.0  # linear gain multiplier
+        self.loop = False
+        self.loop_start = 0
+        self.loop_end = self.total_frames
         self._lock = threading.Lock()
 
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
             start = self.position
             end = start + frames
-            if end > self.total_frames:
-                end = self.total_frames
-                self.playing = False
 
-            chunk = self.data[start:end] * self.volume
-            if len(chunk) < frames:
-                outdata[: len(chunk)] = chunk
-                outdata[len(chunk) :] = 0
+            if self.loop:
+                loop_start = self.loop_start
+                loop_end = self.loop_end
+                # Fill output handling loop wrap
+                written = 0
+                while written < frames:
+                    remaining = frames - written
+                    chunk_end = min(start + remaining, loop_end)
+                    chunk_len = chunk_end - start
+                    if chunk_len <= 0:
+                        start = loop_start
+                        continue
+                    outdata[written:written + chunk_len] = self.data[start:chunk_end] * self.volume
+                    written += chunk_len
+                    start = chunk_end
+                    if start >= loop_end:
+                        start = loop_start
+                self.position = start
             else:
-                outdata[:] = chunk
-
-            self.position = end
+                if end > self.total_frames:
+                    end = self.total_frames
+                    self.playing = False
+                chunk = self.data[start:end] * self.volume
+                if len(chunk) < frames:
+                    outdata[: len(chunk)] = chunk
+                    outdata[len(chunk) :] = 0
+                else:
+                    outdata[:] = chunk
+                self.position = end
 
     def play(self):
         if self.position >= self.total_frames:
@@ -348,10 +369,16 @@ def main(stdscr, filepath: str):
                 start_marker = player.current_time
                 status_msg = f"Start marker: {format_time(start_marker)}"
                 status_time = time.time()
+                if player.loop and end_marker is not None and start_marker < end_marker:
+                    player.loop_start = int(start_marker * player.samplerate)
+                    player.loop_end = int(end_marker * player.samplerate)
             elif key == "e":
                 end_marker = player.current_time
                 status_msg = f"End marker: {format_time(end_marker)}"
                 status_time = time.time()
+                if player.loop and start_marker is not None and start_marker < end_marker:
+                    player.loop_start = int(start_marker * player.samplerate)
+                    player.loop_end = int(end_marker * player.samplerate)
             elif key == "0":
                 player.seek_to(0)
             elif key == "$":
@@ -396,6 +423,19 @@ def main(stdscr, filepath: str):
                 player.volume = max(0.0, player.volume - 0.1)
                 status_msg = f"Volume: {player.volume:.0%}"
                 status_time = time.time()
+            elif key == "r":
+                player.loop = not player.loop
+                if player.loop:
+                    if start_marker is not None and end_marker is not None and start_marker < end_marker:
+                        player.loop_start = int(start_marker * player.samplerate)
+                        player.loop_end = int(end_marker * player.samplerate)
+                    else:
+                        player.loop_start = 0
+                        player.loop_end = player.total_frames
+                    status_msg = f"Loop ON ({format_time(player.loop_start / player.samplerate)} → {format_time(player.loop_end / player.samplerate)})"
+                else:
+                    status_msg = "Loop OFF"
+                status_time = time.time()
             elif key == "\t":
                 nf = next_file(filepath)
                 if nf:
@@ -414,8 +454,9 @@ def main(stdscr, filepath: str):
         # Header
         fname = Path(filepath).name
         mode = "▶" if player.playing else "⏸"
+        loop_indicator = " 🔁" if player.loop else ""
         vol = f"{player.volume:.0%}"
-        header = f" {mode} {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}"
+        header = f" {mode} {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}{loop_indicator}"
         stdscr.addstr(0, 0, header[:width-1], curses.A_BOLD)
         # Filename right-aligned
         if len(fname) + len(header) + 2 < width:
@@ -589,7 +630,7 @@ def main(stdscr, filepath: str):
 
         # Help line at bottom
         help_y = height - 1
-        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s:start  e:end  ⏎:render  tab:next  q:quit"
+        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s/e:markers  r:loop  ⏎:render  tab:next  q:quit"
         try:
             stdscr.addstr(help_y, 0, help_text[:width-1], curses.color_pair(6) | curses.A_DIM)
         except curses.error:
