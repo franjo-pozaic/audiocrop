@@ -1,4 +1,4 @@
-# sound-cutter
+# audiocrop
 
 Terminal audio trimmer with waveform display. Set start/end markers, render to normalized MP3 via ffmpeg.
 
@@ -13,7 +13,7 @@ Requires `ffmpeg` on PATH.
 ## Usage
 
 ```bash
-python sound_cutter.py <audio_file>
+python audiocrop.py <audio_file>
 ```
 
 ## Controls

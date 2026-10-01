@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-sound-cutter: Terminal audio file trimmer with waveform display.
+audiocrop: Terminal audio file trimmer with waveform display.
 
-Usage: python sound_cutter.py [audio_file]
+Usage: python audiocrop.py [audio_file]
        (without args, opens fzf picker in current directory)
 
 Controls (vim-inspired):
