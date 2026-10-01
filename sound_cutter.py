@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+sound-cutter: Terminal audio file trimmer with waveform display.
+
+Usage: python sound_cutter.py [audio_file]
+       (without args, opens fzf picker in current directory)
+
+Controls (vim-inspired):
+  Space       - play / pause
+  l / Right   - forward 10s
+  h / Left    - backward 10s
+  L / S-Right - forward 1s
+  H / S-Left  - backward 1s
+  W           - forward 30s
+  B           - backward 30s
+  s           - set start marker
+  e           - set end marker
+  Enter       - render selection to normalized mp3
+  0           - jump to start of file
+  $           - jump to end of file
+  g           - jump to start marker
+  G           - jump to end marker
+  Tab         - load next file in directory
+  q / Esc     - quit
+"""
+
+import curses
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+
+class AudioPlayer:
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.info = sf.info(filepath)
+        self.samplerate = self.info.samplerate
+        self.channels = self.info.channels
+        self.duration = self.info.duration
+        self.total_frames = self.info.frames
+
+        # Load full file into memory for waveform + playback
+        self.data, _ = sf.read(filepath, dtype="float32")
+        if self.data.ndim == 1:
+            self.data = self.data.reshape(-1, 1)
+
+        # Playback state
+        self.position = 0  # current frame
+        self.playing = False
+        self.stream = None
+        self.volume = 1.0  # linear gain multiplier
+        self._lock = threading.Lock()
+
+    def _callback(self, outdata, frames, time_info, status):
+        with self._lock:
+            start = self.position
+            end = start + frames
+            if end > self.total_frames:
+                end = self.total_frames
+                self.playing = False
+
+            chunk = self.data[start:end] * self.volume
+            if len(chunk) < frames:
+                outdata[: len(chunk)] = chunk
+                outdata[len(chunk) :] = 0
+            else:
+                outdata[:] = chunk
+
+            self.position = end
+
+    def play(self):
+        if self.position >= self.total_frames:
+            self.position = 0
+        self.playing = True
+        if self.stream is None:
+            self.stream = sd.OutputStream(
+                samplerate=self.samplerate,
+                channels=self.channels,
+                callback=self._callback,
+                blocksize=2048,
+            )
+            self.stream.start()
+
+    def pause(self):
+        self.playing = False
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+
+    def toggle(self):
+        if self.playing:
+            self.pause()
+        else:
+            self.play()
+
+    def seek(self, seconds: float):
+        with self._lock:
+            frame = self.position + int(seconds * self.samplerate)
+            self.position = max(0, min(frame, self.total_frames))
+
+    def seek_to(self, seconds: float):
+        with self._lock:
+            self.position = max(0, min(int(seconds * self.samplerate), self.total_frames))
+
+    @property
+    def current_time(self) -> float:
+        return self.position / self.samplerate
+
+    def get_waveform_peaks(self, num_bins: int) -> np.ndarray:
+        """Downsample audio to num_bins peak values for display."""
+        mono = self.data.mean(axis=1) if self.data.ndim > 1 else self.data.flatten()
+        frames_per_bin = max(1, len(mono) // num_bins)
+        peaks = np.zeros(num_bins)
+        for i in range(num_bins):
+            start = i * frames_per_bin
+            end = min(start + frames_per_bin, len(mono))
+            if start < len(mono):
+                peaks[i] = np.max(np.abs(mono[start:end]))
+        return peaks
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
+    ".wma", ".aiff", ".opus", ".webm", ".mp4",
+}
+
+
+def pick_file_fzf(directory: str = ".") -> str | None:
+    """Open fzf to pick an audio file from directory."""
+    # Find audio files
+    audio_files = sorted(
+        p for p in Path(directory).rglob("*")
+        if p.suffix.lower() in AUDIO_EXTENSIONS and not p.name.startswith(".")
+    )
+    if not audio_files:
+        print("No audio files found in current directory.")
+        return None
+
+    input_list = "\n".join(str(p) for p in audio_files)
+    try:
+        result = subprocess.run(
+            ["fzf", "--prompt=audio> "],
+            input=input_list,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("fzf not found. Install it or pass a file path directly.")
+    return None
+
+
+def get_audio_files_in_dir(filepath: str) -> list[str]:
+    """Get sorted list of audio files in the same directory (resolved paths)."""
+    directory = Path(filepath).resolve().parent
+    return sorted(
+        str(p.resolve()) for p in directory.iterdir()
+        if p.suffix.lower() in AUDIO_EXTENSIONS and not p.name.startswith(".")
+    )
+
+
+def next_file(filepath: str) -> str | None:
+    """Get the next audio file in the directory, wrapping around."""
+    files = get_audio_files_in_dir(filepath)
+    if len(files) <= 1:
+        return None
+    current = str(Path(filepath).resolve())
+    try:
+        idx = files.index(current)
+    except ValueError:
+        return files[0]
+    next_idx = (idx + 1) % len(files)
+    return files[next_idx]
+
+
+def format_time(seconds: float) -> str:
+    m = int(seconds) // 60
+    s = seconds - m * 60
+    return f"{m:02d}:{s:05.2f}"
+
+
+def render_selection(filepath: str, start: float, end: float) -> str:
+    """Render the selection to a normalized mp3 via ffmpeg (two-pass loudnorm)."""
+    import json as _json
+
+    src = Path(filepath)
+    stem = src.stem
+
+    def _ts(secs):
+        m, s = divmod(int(secs), 60)
+        return f"{m:02d}m{s:02d}s"
+
+    out_name = f"{stem}_{_ts(start)}-{_ts(end)}.mp3"
+    out_path = src.parent / out_name
+
+    duration = end - start
+
+    # Pass 1: measure loudness
+    measure_cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(start),
+        "-t", str(duration),
+        "-i", str(src),
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null",
+        "/dev/null",
+    ]
+    result = subprocess.run(measure_cmd, capture_output=True, text=True)
+    # loudnorm stats are printed to stderr
+    stderr = result.stderr
+
+    # Parse the JSON block from stderr
+    json_start = stderr.rfind("{")
+    json_end = stderr.rfind("}") + 1
+    if json_start == -1 or json_end == 0:
+        raise RuntimeError(f"Failed to parse loudnorm output:\n{stderr[-300:]}")
+
+    stats = _json.loads(stderr[json_start:json_end])
+
+    # Pass 2: apply simple linear gain to hit -16 LUFS (no compression)
+    measured_i = float(stats['input_i'])
+    gain_db = -16.0 - measured_i
+
+    # Clamp so true peak doesn't exceed -1.5 dBTP
+    measured_tp = float(stats['input_tp'])
+    max_gain = -1.5 - measured_tp
+    gain_db = min(gain_db, max_gain)
+
+    loudnorm_filter = f"volume={gain_db:.2f}dB"
+
+    encode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(start),
+        "-t", str(duration),
+        "-i", str(src),
+        "-af", loudnorm_filter,
+        "-codec:a", "libmp3lame",
+        "-q:a", "0",
+        str(out_path),
+    ]
+    subprocess.run(encode_cmd, capture_output=True, check=True)
+    return str(out_path)
+
+
+def main(stdscr, filepath: str):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    stdscr.nodelay(True)
+    stdscr.timeout(50)  # 50ms refresh
+
+    # Init color pairs
+    curses.init_pair(1, curses.COLOR_GREEN, -1)   # waveform
+    curses.init_pair(2, curses.COLOR_CYAN, -1)    # playhead
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)  # markers
+    curses.init_pair(4, curses.COLOR_RED, -1)     # selection
+    curses.init_pair(5, curses.COLOR_WHITE, -1)   # status
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1) # help
+
+    player = AudioPlayer(filepath)
+
+    start_marker = None  # in seconds
+    end_marker = None
+    status_msg = ""
+    status_time = 0
+
+    # Waveform block characters (bottom to top)
+    blocks = " ▁▂▃▄▅▆▇█"
+
+    def load_file(new_path: str):
+        nonlocal player, filepath, start_marker, end_marker, status_msg, status_time
+        player.pause()
+        filepath = new_path
+        player = AudioPlayer(filepath)
+        start_marker = None
+        end_marker = None
+        status_msg = f"Loaded: {Path(filepath).name}"
+        status_time = time.time()
+
+    while True:
+        try:
+            key = stdscr.get_wch()
+        except curses.error:
+            key = None
+
+        # Handle input
+        if key == " ":
+            player.toggle()
+        elif key == "q" or key == "\x1b":
+            player.pause()
+            break
+        elif key == "h" or key == curses.KEY_LEFT:
+            player.seek(-10)
+        elif key == "l" or key == curses.KEY_RIGHT:
+            player.seek(10)
+        elif key == "H":
+            player.seek(-1)
+        elif key == "L":
+            player.seek(1)
+        elif key == "W":
+            player.seek(30)
+        elif key == "B":
+            player.seek(-30)
+        elif key == "s":
+            start_marker = player.current_time
+            status_msg = f"Start marker: {format_time(start_marker)}"
+            status_time = time.time()
+        elif key == "e":
+            end_marker = player.current_time
+            status_msg = f"End marker: {format_time(end_marker)}"
+            status_time = time.time()
+        elif key == "0":
+            player.seek_to(0)
+        elif key == "$":
+            player.seek_to(player.duration)
+        elif key == "g":
+            if start_marker is not None:
+                player.seek_to(start_marker)
+        elif key == "G":
+            if end_marker is not None:
+                player.seek_to(end_marker)
+        elif key == "\n" or key == curses.KEY_ENTER:
+            if start_marker is not None and end_marker is not None:
+                if start_marker < end_marker:
+                    player.pause()
+                    status_msg = "Rendering..."
+                    status_time = time.time()
+                    stdscr.clear()
+                    stdscr.addstr(0, 0, "Rendering... please wait")
+                    stdscr.refresh()
+                    try:
+                        out = render_selection(filepath, start_marker, end_marker)
+                        status_msg = f"Saved: {out}"
+                    except subprocess.CalledProcessError as ex:
+                        status_msg = f"ffmpeg error: {ex.stderr.decode()[:80]}"
+                    status_time = time.time()
+                else:
+                    status_msg = "Error: start must be before end"
+                    status_time = time.time()
+            else:
+                status_msg = "Set both markers first (s/e)"
+                status_time = time.time()
+        # Arrow key escape sequences for shift/cmd combos
+        elif key == curses.KEY_SLEFT:
+            player.seek(-1)
+        elif key == curses.KEY_SRIGHT:
+            player.seek(1)
+        elif key == "+" or key == "=":
+            player.volume = min(5.0, player.volume + 0.1)
+            status_msg = f"Volume: {player.volume:.0%}"
+            status_time = time.time()
+        elif key == "-":
+            player.volume = max(0.0, player.volume - 0.1)
+            status_msg = f"Volume: {player.volume:.0%}"
+            status_time = time.time()
+        elif key == "\t":
+            nf = next_file(filepath)
+            if nf:
+                load_file(nf)
+            else:
+                status_msg = "No other audio files in directory"
+                status_time = time.time()
+
+        # Draw
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        # Header
+        fname = Path(filepath).name
+        mode = "▶ PLAY" if player.playing else "⏸ PAUSE"
+        vol = f"{player.volume:.0%}"
+        header = f" {fname}  [{mode}]  {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}"
+        stdscr.addstr(0, 0, header[:width-1], curses.A_BOLD)
+
+        # Waveform area
+        wave_top = 2
+        wave_height = max(4, height - 7)
+        wave_width = width - 2
+
+        if wave_width > 0:
+            peaks = player.get_waveform_peaks(wave_width)
+            max_peak = peaks.max() if peaks.max() > 0 else 1.0
+
+            # Determine playhead position in columns
+            progress = player.current_time / player.duration if player.duration > 0 else 0
+            playhead_col = int(progress * (wave_width - 1))
+
+            # Marker columns
+            start_col = None
+            end_col = None
+            if start_marker is not None:
+                start_col = int((start_marker / player.duration) * (wave_width - 1))
+            if end_marker is not None:
+                end_col = int((end_marker / player.duration) * (wave_width - 1))
+
+            # Draw waveform
+            for col in range(wave_width):
+                peak_val = peaks[col] / max_peak
+                bar_height = int(peak_val * wave_height)
+
+                # Determine color
+                in_selection = (
+                    start_col is not None
+                    and end_col is not None
+                    and start_col <= col <= end_col
+                )
+
+                for row in range(wave_height):
+                    y = wave_top + wave_height - 1 - row
+                    if y >= height - 1:
+                        continue
+
+                    if col == playhead_col:
+                        char = "│"
+                        color = curses.color_pair(2) | curses.A_BOLD
+                    elif col == start_col or col == end_col:
+                        char = "│"
+                        color = curses.color_pair(3) | curses.A_BOLD
+                    elif row < bar_height:
+                        idx = min(len(blocks) - 1, int((row / wave_height) * (len(blocks) - 1)) + 1)
+                        char = blocks[idx]
+                        if in_selection:
+                            color = curses.color_pair(4)
+                        else:
+                            color = curses.color_pair(1)
+                    else:
+                        char = " "
+                        color = 0
+
+                    try:
+                        stdscr.addch(y, col + 1, char, color)
+                    except curses.error:
+                        pass
+
+        # Marker info line
+        info_y = wave_top + wave_height + 1
+        if info_y < height - 2:
+            marker_info = ""
+            if start_marker is not None:
+                marker_info += f"  [S] {format_time(start_marker)}"
+            if end_marker is not None:
+                marker_info += f"  [E] {format_time(end_marker)}"
+            if start_marker is not None and end_marker is not None:
+                sel_dur = end_marker - start_marker
+                marker_info += f"  (sel: {format_time(abs(sel_dur))})"
+            if marker_info:
+                try:
+                    stdscr.addstr(info_y, 1, marker_info[:width-2], curses.color_pair(3))
+                except curses.error:
+                    pass
+
+        # Status message (fades after 5s)
+        if status_msg and (time.time() - status_time < 5):
+            status_y = height - 2
+            if status_y > 0:
+                try:
+                    stdscr.addstr(status_y, 1, status_msg[:width-2], curses.color_pair(5))
+                except curses.error:
+                    pass
+
+        # Help line at bottom
+        help_y = height - 1
+        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s:start  e:end  enter:render  tab:next  q:quit"
+        try:
+            stdscr.addstr(help_y, 0, help_text[:width-1], curses.color_pair(6) | curses.A_DIM)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+    # Stop playback on exit
+    player.pause()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2:
+        target = Path(sys.argv[1])
+        if target.is_dir():
+            filepath = pick_file_fzf(str(target))
+            if not filepath:
+                sys.exit(1)
+        elif target.exists():
+            filepath = str(target.resolve())
+        else:
+            print(f"File not found: {target}")
+            sys.exit(1)
+    else:
+        filepath = pick_file_fzf()
+        if not filepath:
+            sys.exit(1)
+
+    curses.wrapper(main, filepath)
