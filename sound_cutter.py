@@ -225,6 +225,20 @@ def next_file(filepath: str) -> str | None:
     return files[next_idx]
 
 
+def prev_file(filepath: str) -> str | None:
+    """Get the previous audio file in the directory, wrapping around."""
+    files = get_audio_files_in_dir(filepath)
+    if len(files) <= 1:
+        return None
+    current = str(Path(filepath).resolve())
+    try:
+        idx = files.index(current)
+    except ValueError:
+        return files[-1]
+    prev_idx = (idx - 1) % len(files)
+    return files[prev_idx]
+
+
 def format_time(seconds: float) -> str:
     m = int(seconds) // 60
     s = seconds - m * 60
@@ -468,6 +482,13 @@ def main(stdscr, filepath: str):
                 nf = next_file(filepath)
                 if nf:
                     load_file(nf)
+                else:
+                    status_msg = "No other audio files in directory"
+                    status_time = time.time()
+            elif key == curses.KEY_BTAB:
+                pf = prev_file(filepath)
+                if pf:
+                    load_file(pf)
                 else:
                     status_msg = "No other audio files in directory"
                     status_time = time.time()
