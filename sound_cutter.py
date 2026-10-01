@@ -296,8 +296,8 @@ def main(stdscr, filepath: str):
     status_msg = ""
     status_time = 0
 
-    # Waveform block characters (bottom to top)
-    blocks = " ▁▂▃▄▅▆▇█"
+    # Waveform block characters
+    blocks = "░▒▓█"
 
     def load_file(new_path: str):
         nonlocal player, filepath, start_marker, end_marker, status_msg, status_time
@@ -413,25 +413,45 @@ def main(stdscr, filepath: str):
 
         # Header
         fname = Path(filepath).name
-        mode = "▶ PLAY" if player.playing else "⏸ PAUSE"
+        mode = "▶" if player.playing else "⏸"
         vol = f"{player.volume:.0%}"
-        header = f" {fname}  [{mode}]  {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}"
+        header = f" {mode} {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}"
         stdscr.addstr(0, 0, header[:width-1], curses.A_BOLD)
+        # Filename right-aligned
+        if len(fname) + len(header) + 2 < width:
+            try:
+                stdscr.addstr(0, width - len(fname) - 1, fname, curses.A_DIM)
+            except curses.error:
+                pass
 
-        # Waveform area
-        wave_top = 2
-        wave_height = max(4, height - 7)
+        # Timeline ruler
+        ruler_y = 1
+        ruler = ""
+        num_marks = min(10, width // 12)
+        for i in range(num_marks + 1):
+            t = (i / num_marks) * player.duration
+            label = format_time(t)
+            pos = int((i / num_marks) * (width - len(label) - 2))
+            ruler = ruler.ljust(pos) + label
+        try:
+            stdscr.addstr(ruler_y, 1, ruler[:width-2], curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Waveform area — mirrored (centered on midline)
+        wave_top = 3
+        wave_height = max(6, height - 9)
         wave_width = width - 2
+        mid_row = wave_top + wave_height // 2
 
         if wave_width > 0:
             peaks = player.get_waveform_peaks(wave_width)
             max_peak = peaks.max() if peaks.max() > 0 else 1.0
 
-            # Determine playhead position in columns
+            # Positions in columns
             progress = player.current_time / player.duration if player.duration > 0 else 0
             playhead_col = int(progress * (wave_width - 1))
 
-            # Marker columns
             start_col = None
             end_col = None
             if start_marker is not None:
@@ -439,56 +459,119 @@ def main(stdscr, filepath: str):
             if end_marker is not None:
                 end_col = int((end_marker / player.duration) * (wave_width - 1))
 
-            # Draw waveform
-            for col in range(wave_width):
-                peak_val = peaks[col] / max_peak
-                bar_height = int(peak_val * wave_height)
+            half = wave_height // 2
 
-                # Determine color
+            for col in range(wave_width):
+                peak_norm = peaks[col] / max_peak
+                bar_half = int(peak_norm * half)
+
                 in_selection = (
                     start_col is not None
                     and end_col is not None
                     and start_col <= col <= end_col
                 )
 
-                for row in range(wave_height):
-                    y = wave_top + wave_height - 1 - row
-                    if y >= height - 1:
-                        continue
+                x = col + 1
 
-                    if col == playhead_col:
-                        char = "│"
-                        color = curses.color_pair(2) | curses.A_BOLD
-                    elif col == start_col or col == end_col:
-                        char = "│"
-                        color = curses.color_pair(3) | curses.A_BOLD
-                    elif row < bar_height:
-                        idx = min(len(blocks) - 1, int((row / wave_height) * (len(blocks) - 1)) + 1)
-                        char = blocks[idx]
-                        if in_selection:
-                            color = curses.color_pair(4)
+                # Draw the midline dot
+                if col == playhead_col:
+                    mid_char = "┃"
+                    mid_color = curses.color_pair(2) | curses.A_BOLD
+                elif col == start_col:
+                    mid_char = "["
+                    mid_color = curses.color_pair(3) | curses.A_BOLD
+                elif col == end_col:
+                    mid_char = "]"
+                    mid_color = curses.color_pair(3) | curses.A_BOLD
+                elif in_selection:
+                    mid_char = "─"
+                    mid_color = curses.color_pair(4) | curses.A_DIM
+                else:
+                    mid_char = "·"
+                    mid_color = curses.A_DIM
+
+                try:
+                    stdscr.addch(mid_row, x, mid_char, mid_color)
+                except curses.error:
+                    pass
+
+                # Draw bars above and below midline
+                for i in range(1, half + 1):
+                    y_up = mid_row - i
+                    y_down = mid_row + i
+
+                    if i <= bar_half:
+                        if col == playhead_col:
+                            ch_up = "┃"
+                            ch_down = "┃"
+                            color = curses.color_pair(2) | curses.A_BOLD
+                        elif col == start_col or col == end_col:
+                            ch_up = "│"
+                            ch_down = "│"
+                            color = curses.color_pair(3) | curses.A_BOLD
                         else:
-                            color = curses.color_pair(1)
-                    else:
-                        char = " "
-                        color = 0
+                            # Gradient: brighter near midline, dimmer at edges
+                            intensity = 1.0 - (i / half) * 0.6
+                            if intensity > 0.7:
+                                ch_up = "█"
+                                ch_down = "█"
+                            elif intensity > 0.4:
+                                ch_up = "▓"
+                                ch_down = "▓"
+                            else:
+                                ch_up = "░"
+                                ch_down = "░"
 
-                    try:
-                        stdscr.addch(y, col + 1, char, color)
-                    except curses.error:
-                        pass
+                            if in_selection:
+                                color = curses.color_pair(4)
+                            else:
+                                color = curses.color_pair(1)
+                    else:
+                        if col == playhead_col:
+                            ch_up = "│"
+                            ch_down = "│"
+                            color = curses.color_pair(2) | curses.A_DIM
+                        elif col == start_col or col == end_col:
+                            ch_up = "│"
+                            ch_down = "│"
+                            color = curses.color_pair(3) | curses.A_DIM
+                        else:
+                            ch_up = " "
+                            ch_down = " "
+                            color = 0
+
+                    if y_up >= wave_top and y_up < height - 1:
+                        try:
+                            stdscr.addch(y_up, x, ch_up, color)
+                        except curses.error:
+                            pass
+                    if y_down < wave_top + wave_height and y_down < height - 1:
+                        try:
+                            stdscr.addch(y_down, x, ch_down, color)
+                        except curses.error:
+                            pass
+
+        # Progress bar
+        prog_y = wave_top + wave_height + 1
+        if prog_y < height - 3 and wave_width > 0:
+            filled = int(progress * wave_width)
+            bar = "━" * filled + "╸" + "─" * (wave_width - filled - 1)
+            try:
+                stdscr.addstr(prog_y, 1, bar[:wave_width], curses.color_pair(2))
+            except curses.error:
+                pass
 
         # Marker info line
-        info_y = wave_top + wave_height + 1
+        info_y = wave_top + wave_height + 2
         if info_y < height - 2:
             marker_info = ""
             if start_marker is not None:
-                marker_info += f"  [S] {format_time(start_marker)}"
+                marker_info += f" S:{format_time(start_marker)}"
             if end_marker is not None:
-                marker_info += f"  [E] {format_time(end_marker)}"
+                marker_info += f"  E:{format_time(end_marker)}"
             if start_marker is not None and end_marker is not None:
                 sel_dur = end_marker - start_marker
-                marker_info += f"  (sel: {format_time(abs(sel_dur))})"
+                marker_info += f"  ═ {format_time(abs(sel_dur))}"
             if marker_info:
                 try:
                     stdscr.addstr(info_y, 1, marker_info[:width-2], curses.color_pair(3))
@@ -506,7 +589,7 @@ def main(stdscr, filepath: str):
 
         # Help line at bottom
         help_y = height - 1
-        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s:start  e:end  enter:render  tab:next  q:quit"
+        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s:start  e:end  ⏎:render  tab:next  q:quit"
         try:
             stdscr.addstr(help_y, 0, help_text[:width-1], curses.color_pair(6) | curses.A_DIM)
         except curses.error:
