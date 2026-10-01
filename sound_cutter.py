@@ -583,15 +583,19 @@ def main(stdscr, filepath: str):
 
         # Header
         fname = Path(filepath).name
-        mode = "▶" if player.playing else "⏸"
-        loop_indicator = " 🔁" if player.loop else ""
+        mode = "PLAY" if player.playing else "STOP"
+        loop_indicator = " [loop]" if player.loop else ""
         vol = f"{player.volume:.0%}"
-        header = f" {mode} {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}{loop_indicator}"
-        stdscr.addstr(0, 0, header[:width-1], curses.A_BOLD)
+        header = f" [{mode}] {format_time(player.current_time)} / {format_time(player.duration)}  vol:{vol}{loop_indicator}"
+        try:
+            stdscr.addstr(0, 0, header[:width-1], curses.A_BOLD)
+        except curses.error:
+            pass
         # Filename right-aligned
-        if len(fname) + len(header) + 2 < width:
+        fname_col = width - len(fname) - 1
+        if fname_col > len(header) + 1:
             try:
-                stdscr.addstr(0, width - len(fname) - 1, fname, curses.A_DIM)
+                stdscr.addstr(0, fname_col, fname, curses.A_DIM)
             except curses.error:
                 pass
 
