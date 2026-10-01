@@ -8,12 +8,14 @@ Terminal audio trimmer with waveform display. Set start/end markers, render to n
 pip install -r requirements.txt
 ```
 
-Requires `ffmpeg` on PATH.
+Requires `ffmpeg` on PATH. The file picker needs `fzf` on PATH (optional, only used when you run without a file argument).
 
 ## Usage
 
 ```bash
-python audiocrop.py <audio_file>
+python audiocrop.py <audio_file>   # open a specific file
+python audiocrop.py <directory>    # pick a file in <directory> via fzf
+python audiocrop.py                # pick a file in the current directory via fzf
 ```
 
 ## Controls
@@ -33,7 +35,12 @@ python audiocrop.py <audio_file>
 | `G` | Jump to end marker |
 | `0` | Jump to beginning |
 | `$` | Jump to end |
+| `r` | Toggle loop (loops the selection if both markers are set) |
+| `+` / `-` | Volume up / down |
 | `Enter` | Render selection to MP3 |
+| `Tab` | Load next file in directory |
+| `Shift+Tab` | Load previous file in directory |
+| `D` | Delete current file (with confirmation) |
 | `q` / `Esc` | Quit |
 
 ## Output
