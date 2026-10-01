@@ -436,6 +436,34 @@ def main(stdscr, filepath: str):
                 else:
                     status_msg = "Loop OFF"
                 status_time = time.time()
+            elif key == "D":
+                # Confirm delete
+                player.pause()
+                try:
+                    stdscr.addstr(height - 2, 1, f"Delete {Path(filepath).name}? (y/N) ", curses.color_pair(4) | curses.A_BOLD)
+                except curses.error:
+                    pass
+                stdscr.refresh()
+                stdscr.nodelay(False)
+                try:
+                    confirm = stdscr.get_wch()
+                except curses.error:
+                    confirm = None
+                stdscr.nodelay(True)
+                stdscr.timeout(16)
+                if confirm == "y" or confirm == "Y":
+                    deleted_path = filepath
+                    nf = next_file(filepath)
+                    Path(deleted_path).unlink()
+                    status_msg = f"Deleted: {Path(deleted_path).name}"
+                    status_time = time.time()
+                    if nf and nf != deleted_path:
+                        load_file(nf)
+                    else:
+                        return
+                else:
+                    status_msg = "Delete cancelled"
+                    status_time = time.time()
             elif key == "\t":
                 nf = next_file(filepath)
                 if nf:
@@ -630,7 +658,7 @@ def main(stdscr, filepath: str):
 
         # Help line at bottom
         help_y = height - 1
-        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s/e:markers  r:loop  ⏎:render  tab:next  q:quit"
+        help_text = " space:play  h/l:±10s  H/L:±1s  W/B:±30s  +/-:vol  s/e:markers  r:loop  ⏎:render  D:delete  tab:next  q:quit"
         try:
             stdscr.addstr(help_y, 0, help_text[:width-1], curses.color_pair(6) | curses.A_DIM)
         except curses.error:
