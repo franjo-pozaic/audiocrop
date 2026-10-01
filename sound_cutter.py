@@ -245,18 +245,19 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
-def render_selection(filepath: str, start: float, end: float) -> str:
+def render_selection(filepath: str, start: float, end: float, out_name: str = None) -> str:
     """Render the selection to a normalized mp3 via ffmpeg (two-pass loudnorm)."""
     import json as _json
 
     src = Path(filepath)
-    stem = src.stem
 
-    def _ts(secs):
-        m, s = divmod(int(secs), 60)
-        return f"{m:02d}m{s:02d}s"
+    if out_name is None:
+        stem = src.stem
+        def _ts(secs):
+            m, s = divmod(int(secs), 60)
+            return f"{m:02d}m{s:02d}s"
+        out_name = f"{stem}_{_ts(start)}-{_ts(end)}.mp3"
 
-    out_name = f"{stem}_{_ts(start)}-{_ts(end)}.mp3"
     out_path = src.parent / out_name
 
     duration = end - start
@@ -407,17 +408,97 @@ def main(stdscr, filepath: str):
                 if start_marker is not None and end_marker is not None:
                     if start_marker < end_marker:
                         player.pause()
-                        status_msg = "Rendering..."
-                        status_time = time.time()
-                        stdscr.clear()
-                        stdscr.addstr(0, 0, "Rendering... please wait")
-                        stdscr.refresh()
-                        try:
-                            out = render_selection(filepath, start_marker, end_marker)
-                            status_msg = f"Saved: {out}"
-                        except subprocess.CalledProcessError as ex:
-                            status_msg = f"ffmpeg error: {ex.stderr.decode()[:80]}"
-                        status_time = time.time()
+
+                        # Generate default name
+                        src = Path(filepath)
+                        def _ts(secs):
+                            m, s = divmod(int(secs), 60)
+                            return f"{m:02d}m{s:02d}s"
+                        default_name = f"{src.stem}_{_ts(start_marker)}-{_ts(end_marker)}.mp3"
+
+                        # Prompt for filename
+                        prompt = "Filename: "
+                        edit_buf = list(default_name)
+                        cursor_pos = len(edit_buf)
+                        stdscr.nodelay(False)
+                        confirmed = False
+
+                        while True:
+                            try:
+                                stdscr.move(height - 2, 0)
+                                stdscr.clrtoeol()
+                                stdscr.addstr(height - 2, 1, prompt, curses.color_pair(5) | curses.A_BOLD)
+                                displayed = "".join(edit_buf)
+                                stdscr.addstr(height - 2, 1 + len(prompt), displayed[:width - len(prompt) - 3])
+                                curses.curs_set(1)
+                                stdscr.move(height - 2, 1 + len(prompt) + min(cursor_pos, width - len(prompt) - 3))
+                            except curses.error:
+                                pass
+                            stdscr.refresh()
+
+                            try:
+                                ch = stdscr.get_wch()
+                            except curses.error:
+                                continue
+
+                            if ch == "\n" or ch == curses.KEY_ENTER:
+                                confirmed = True
+                                break
+                            elif ch == "\x1b":  # Escape
+                                break
+                            elif ch == curses.KEY_BACKSPACE or ch == "\x7f" or ch == "\b":
+                                if cursor_pos > 0:
+                                    edit_buf.pop(cursor_pos - 1)
+                                    cursor_pos -= 1
+                            elif ch == curses.KEY_DC:
+                                if cursor_pos < len(edit_buf):
+                                    edit_buf.pop(cursor_pos)
+                            elif ch == curses.KEY_LEFT:
+                                cursor_pos = max(0, cursor_pos - 1)
+                            elif ch == curses.KEY_RIGHT:
+                                cursor_pos = min(len(edit_buf), cursor_pos + 1)
+                            elif ch == curses.KEY_HOME or ch == "\x01":  # ctrl-a
+                                cursor_pos = 0
+                            elif ch == curses.KEY_END or ch == "\x05":  # ctrl-e
+                                cursor_pos = len(edit_buf)
+                            elif ch == "\x15":  # ctrl-u: clear line
+                                edit_buf.clear()
+                                cursor_pos = 0
+                            elif ch == "\x17":  # ctrl-w: delete word back
+                                while cursor_pos > 0 and edit_buf[cursor_pos - 1] == " ":
+                                    edit_buf.pop(cursor_pos - 1)
+                                    cursor_pos -= 1
+                                while cursor_pos > 0 and edit_buf[cursor_pos - 1] != " ":
+                                    edit_buf.pop(cursor_pos - 1)
+                                    cursor_pos -= 1
+                            elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+                                edit_buf.insert(cursor_pos, ch)
+                                cursor_pos += 1
+
+                        curses.curs_set(0)
+                        stdscr.nodelay(True)
+                        stdscr.timeout(16)
+
+                        if confirmed and edit_buf:
+                            out_name = "".join(edit_buf)
+                            if not out_name.endswith(".mp3"):
+                                out_name += ".mp3"
+                            status_msg = "Rendering..."
+                            status_time = time.time()
+                            stdscr.clear()
+                            stdscr.addstr(0, 0, "Rendering... please wait")
+                            stdscr.refresh()
+                            try:
+                                out = render_selection(filepath, start_marker, end_marker, out_name)
+                                status_msg = f"Saved: {out}"
+                            except subprocess.CalledProcessError as ex:
+                                status_msg = f"ffmpeg error: {ex.stderr.decode()[:80]}"
+                            except RuntimeError as ex:
+                                status_msg = str(ex)[:width-2]
+                            status_time = time.time()
+                        else:
+                            status_msg = "Render cancelled"
+                            status_time = time.time()
                     else:
                         status_msg = "Error: start must be before end"
                         status_time = time.time()
